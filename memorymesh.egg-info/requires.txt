@@ -1,0 +1,11 @@
+networkx>=3.2
+numpy>=1.26
+
+[dev]
+pytest>=8.0
+pytest-benchmark>=4.0
+
+[gpu]
+faiss-gpu>=1.7
+cugraph>=24.02
+cudf>=24.02
