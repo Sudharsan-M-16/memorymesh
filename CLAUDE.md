@@ -10,9 +10,9 @@ MemoryMesh is **"The Persistent Cognitive Substrate for the Agentic Internet"** 
 
 | Property | Value |
 |----------|-------|
-| **Current Phase** | Brain Stem — Week 1 (v0.1.0) |
+| **Current Phase** | Temporal Persistence — Week 2 (v0.2.0) |
 | **Stack** | Pure Python 3.11+, NetworkX, NumPy |
-| **Not yet active** | FastAPI (Week 6), GPU (Week 2), WAL persistence |
+| **Not yet active** | FastAPI (Week 6), GPU acceleration |
 
 ---
 
@@ -51,7 +51,9 @@ python -m pytest tests/ -v --benchmark-only
 types.py              → (no internal deps, vocabulary only)
 memory_node.py        → types.py
 trust_engine.py       → (standalone, no internal deps)
-mesh_core.py          → memory_node.py, types.py
+wal.py                → (standalone, JSON-lines persistence)
+temporal.py           → (standalone, decay/boost math)
+mesh_core.py          → memory_node.py, types.py, wal.py, temporal.py
 __init__.py           → aggregates all above (public API)
 ```
 
@@ -62,7 +64,9 @@ __init__.py           → aggregates all above (public API)
 | `types.py` | `EdgeLabel`, exceptions | Shared vocabulary — 5 edge labels + error types |
 | `memory_node.py` | `MemoryNode` | Immutable 7-tuple cognitive unit `(id, e, τ, C, R, T, κ)` |
 | `trust_engine.py` | `BayesianTrustEngine` | Per-agent Beta-Binomial trust tracking `BTS = α/(α+β)` |
-| `mesh_core.py` | `MemoryMeshCore`, `CRDTState` | 2P2P-Graph CRDT engine + graph traversal |
+| `wal.py` | `WriteAheadLog`, `WALEntry` | Append-only WAL: fsync'd JSON-lines, crash recovery, replay |
+| `temporal.py` | `DecayConfig`, `AccessTracker` | Ebbinghaus decay + spaced repetition boost (lazy on read) |
+| `mesh_core.py` | `MemoryMeshCore`, `CRDTState` | 2P2P-Graph CRDT engine + WAL integration + time-travel |
 
 ---
 
@@ -146,15 +150,21 @@ NumPy arrays for embeddings must use `dtype=np.float32` for future CUDA compatib
 | **TL-008** | `trust_audit(agent_id)` | ✅ | `trust_engine.py` |
 | **TMP-001** | Wall-clock + Lamport timestamps | ✅ | `memory_node.py` |
 | **TMP-002** | Lamport element-wise max merge | ✅ | `memory_node.py` |
+| **TMP-003** | Point-in-time `query_at()` | ✅ | `mesh_core.py` |
+| **TMP-004** | Append-only WAL replay | ✅ | `wal.py`, `mesh_core.py` |
+| **TMP-005** | Ebbinghaus confidence decay | ✅ | `temporal.py` |
+| **TMP-006** | Lazy decay on read | ✅ | `temporal.py`, `mesh_core.py` |
+| **TMP-007** | Spaced repetition boost | ✅ | `temporal.py`, `mesh_core.py` |
 | **TMP-008** | `causal_chain(node_id, depth)` | ✅ | `mesh_core.py` |
+| **TMP-009** | WAL compaction via snapshot | ✅ | `wal.py`, `mesh_core.py` |
 | **SYN-001** | 2P2P-Graph CRDT (4 grow-only sets) | ✅ | `mesh_core.py` |
 | **SYN-002** | CRDT merge properties | ✅ | `mesh_core.py` |
 | **SYN-004** | Content-addressed dedup (SHA-256) | ✅ | `memory_node.py` |
 | **SYN-006** | DFS cycle detection | ✅ | `mesh_core.py` |
 | **SYN-007** | Namespace isolation | ✅ | `mesh_core.py` |
 | **TL-003/004** | Semantic conflict detection | ❌ | (Week 3) |
-| **TMP-003/004** | WAL + time-travel queries | ❌ | (Week 2) |
-| **LangChain** | Drop-in integration | ❌ | (Week 4) |
+| **TL-005/006** | Conflict resolution + belief probs | ❌ | (Week 3) |
+| **LangChain** | Drop-in integration | ❌ | (Week 4+) |
 
 ---
 
@@ -162,12 +172,11 @@ NumPy arrays for embeddings must use `dtype=np.float32` for future CUDA compatib
 
 | Feature | PRD Ref | Planned |
 |---------|---------|---------|
-| Write-Ahead Log (persistence) | TMP-004 | Week 2 |
-| Semantic conflict detection | TL-003, TL-004 | Week 3 |
-| Confidence decay (Ebbinghaus) | TMP-005, TMP-006 | Week 3 |
-| GPU acceleration (FAISS, cuGraph) | Performance targets | Week 2 |
-| LangChain integration | Interoperability | Week 4 |
-| LlamaIndex integration | Interoperability | Week 4 |
+| Semantic conflict detection | TL-003, TL-004, TL-005, TL-006 | Week 3 |
+| GPU acceleration (FAISS, cuGraph) | Performance targets | Week 4+ |
+| LangChain integration | Interoperability | Week 5+ |
+| LlamaIndex integration | Interoperability | Week 5+ |
+| Rust hot-path rewrite | Performance | Week 9-10 |
 
 ---
 

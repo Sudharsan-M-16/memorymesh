@@ -12,6 +12,10 @@ This is the central nervous system of MemoryMesh.  It manages:
 
 4. Lamport vector clocks for causal ordering.
 
+5. Optional WAL persistence for crash recovery and time-travel.
+
+6. Lazy confidence decay (Ebbinghaus) and spaced repetition boost.
+
 PRD Requirements covered:
     SYN-001  2P2P-Graph CRDT state model
     SYN-002  Merge satisfies commutativity, associativity, idempotency
@@ -21,24 +25,38 @@ PRD Requirements covered:
     SYN-006  DFS cycle detection on edge insertion
     TMP-001  Wall-clock + Lamport timestamps on every write
     TMP-002  Lamport merge via element-wise max
+    TMP-003  Point-in-time graph queries via query_at()
+    TMP-004  Append-only WAL replay for state reconstruction
+    TMP-005  Ebbinghaus confidence decay
+    TMP-006  Lazy decay on read
+    TMP-007  Spaced repetition boost
     TMP-008  causal_chain(node_id, depth) DAG traversal
+    TMP-009  WAL compaction via snapshot
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
 
 from .memory_node import MemoryNode, content_address, merge_lamport_vectors
+from .temporal import (
+    AccessTracker,
+    DecayConfig,
+    DEFAULT_DECAY_CONFIG,
+    compute_effective_confidence,
+)
 from .types import (
     ALLOWED_EDGE_LABELS,
     CycleDetectedError,
     NamespaceMismatchError,
     NodeNotFoundError,
 )
+from .wal import WALOp, WriteAheadLog
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +99,25 @@ class MemoryMeshCore:
     namespace : str
         Namespace scope.  CRDT merge is only permitted within the
         same namespace (SYN-007).
+    wal_path : str or Path, optional
+        If provided, enables WAL persistence.  All mutations are
+        recorded to this file before being committed.
+        If None, the mesh operates in-memory only (Week 1 compat).
+    decay_config : DecayConfig, optional
+        Configuration for Ebbinghaus confidence decay and spaced
+        repetition boost.  Uses PRD defaults if not specified.
+    replay_wal : bool
+        If True and wal_path exists, replay WAL on initialization
+        to reconstruct state.  Default True.
     """
 
-    def __init__(self, namespace: str = "default") -> None:
+    def __init__(
+        self,
+        namespace: str = "default",
+        wal_path: Optional[str | Path] = None,
+        decay_config: Optional[DecayConfig] = None,
+        replay_wal: bool = True,
+    ) -> None:
         self.namespace = namespace
 
         # --- CRDT sets (mutable during local ops, frozen on snapshot) ---
@@ -100,6 +134,19 @@ class MemoryMeshCore:
 
         # --- Global Lamport vector (incremented per agent per write) ---
         self._lamport: Dict[str, int] = {}
+
+        # --- WAL persistence (TMP-004) ---
+        self._wal: Optional[WriteAheadLog] = None
+        if wal_path is not None:
+            self._wal = WriteAheadLog(wal_path)
+
+        # --- Temporal layer (TMP-005/006/007) ---
+        self._decay_config = decay_config or DEFAULT_DECAY_CONFIG
+        self._access_tracker = AccessTracker()
+
+        # --- Replay WAL to reconstruct state ---
+        if replay_wal and self._wal is not None:
+            self._replay_from_wal()
 
     # =================================================================
     # Properties
@@ -196,6 +243,20 @@ class MemoryMeshCore:
                 "2P-set constraint: removed nodes cannot be re-added"
             )
 
+        # --- WAL: record before commit (TMP-004) ---
+        if self._wal is not None:
+            self._wal.append(
+                op=WALOp.WRITE_NODE,
+                agent_id=agent_id,
+                namespace=self.namespace,
+                payload={
+                    "content": content,
+                    "confidence": confidence,
+                    "lamport_vector": tau,
+                    "node_id": node.id,
+                },
+            )
+
         # Dedup via content-addressed merge (SYN-004)
         existing = self._nodes.get(node.id)
         if existing is not None:
@@ -226,6 +287,16 @@ class MemoryMeshCore:
         """
         if node_id not in self._add_nodes:
             raise NodeNotFoundError(node_id)
+
+        # --- WAL: record before commit ---
+        if self._wal is not None:
+            self._wal.append(
+                op=WALOp.REMOVE_NODE,
+                agent_id="__system__",
+                namespace=self.namespace,
+                payload={"node_id": node_id},
+            )
+
         self._rem_nodes.add(node_id)
         if node_id in self._graph:
             self._graph.remove_node(node_id)
@@ -284,6 +355,19 @@ class MemoryMeshCore:
             if nx.has_path(self._graph, target_id, source_id):
                 raise CycleDetectedError(source_id, target_id, label)
 
+        # --- WAL: record before commit ---
+        if self._wal is not None:
+            self._wal.append(
+                op=WALOp.ADD_EDGE,
+                agent_id="__system__",
+                namespace=self.namespace,
+                payload={
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "label": label,
+                },
+            )
+
         # Commit edge
         edge_tuple = (source_id, target_id, label)
         self._add_edges.add(edge_tuple)
@@ -312,6 +396,20 @@ class MemoryMeshCore:
         edge_tuple = (source_id, target_id, label)
         if edge_tuple not in self._add_edges:
             raise ValueError(f"Edge not found: {edge_tuple}")
+
+        # --- WAL: record before commit ---
+        if self._wal is not None:
+            self._wal.append(
+                op=WALOp.REMOVE_EDGE,
+                agent_id="__system__",
+                namespace=self.namespace,
+                payload={
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "label": label,
+                },
+            )
+
         self._rem_edges.add(edge_tuple)
         if self._graph.has_edge(source_id, target_id):
             self._graph.remove_edge(source_id, target_id)
@@ -385,10 +483,67 @@ class MemoryMeshCore:
     # =================================================================
 
     def get_node(self, node_id: str) -> Optional[MemoryNode]:
-        """Retrieve a memory node by ID, or None if removed/missing."""
+        """Retrieve a memory node by ID, or None if removed/missing.
+
+        Note: this returns the raw node without decay applied.
+        Use ``get_node_with_decay()`` for time-adjusted confidence.
+        """
         if node_id in self._rem_nodes:
             return None
-        return self._nodes.get(node_id)
+        node = self._nodes.get(node_id)
+        if node is not None:
+            self._access_tracker.record_access(node_id)
+        return node
+
+    def get_node_with_decay(
+        self,
+        node_id: str,
+        now_utc: Optional[str] = None,
+    ) -> Optional[Tuple[MemoryNode, float, bool]]:
+        """Retrieve a node with time-decayed confidence (TMP-005/006/007).
+
+        Parameters
+        ----------
+        node_id : str
+            Node to retrieve.
+        now_utc : str, optional
+            Current time for decay calculation.
+
+        Returns
+        -------
+        tuple[MemoryNode, float, bool] or None
+            (node, effective_confidence, was_boosted)
+            Returns None if node is removed or missing.
+        """
+        if node_id in self._rem_nodes:
+            return None
+        node = self._nodes.get(node_id)
+        if node is None:
+            return None
+
+        # Record access (for spaced repetition tracking)
+        self._access_tracker.record_access(node_id, now_utc)
+
+        # Get creation timestamp from provenance
+        created_utc = node.trust_provenance.get("wall_clock_utc")
+        if created_utc is None:
+            return (node, node.confidence, False)
+
+        # Compute access rate for boost eligibility
+        access_rate = self._access_tracker.access_rate_per_hour(
+            node_id, now_utc
+        )
+
+        # Lazy decay + boost (TMP-006)
+        effective_conf, was_boosted = compute_effective_confidence(
+            initial_confidence=node.confidence,
+            created_utc=created_utc,
+            access_rate=access_rate,
+            now_utc=now_utc,
+            config=self._decay_config,
+        )
+
+        return (node, effective_conf, was_boosted)
 
     def get_all_nodes(self) -> list[MemoryNode]:
         """Return all observed (non-removed) memory nodes."""
@@ -397,6 +552,11 @@ class MemoryMeshCore:
             for nid in self.observed_nodes()
             if nid in self._nodes
         ]
+
+    @property
+    def access_tracker(self) -> AccessTracker:
+        """Access the read-frequency tracker (for testing/inspection)."""
+        return self._access_tracker
 
     # =================================================================
     # CRDT merge (SYN-002, SYN-003, SYN-005)
@@ -511,8 +671,154 @@ class MemoryMeshCore:
             rem_edges=frozenset(self._rem_edges),
         )
 
+    # =================================================================
+    # WAL replay (TMP-004)
+    # =================================================================
+
+    def _replay_from_wal(self) -> None:
+        """Replay all WAL entries to reconstruct in-memory state.
+
+        Called during __init__ when a WAL file exists.
+        Temporarily disables WAL recording to avoid re-logging
+        entries that are already persisted.
+        """
+        if self._wal is None:
+            return
+
+        wal_ref = self._wal
+        self._wal = None  # Disable WAL during replay
+
+        try:
+            for entry in wal_ref.replay():
+                if entry.namespace != self.namespace:
+                    continue
+                self._apply_wal_entry(entry)
+        finally:
+            self._wal = wal_ref  # Re-enable WAL
+
+    def _apply_wal_entry(self, entry) -> None:
+        """Apply a single WAL entry to the in-memory state."""
+        p = entry.payload
+
+        if entry.op == WALOp.WRITE_NODE:
+            self.write_memory(
+                content=p["content"],
+                agent_id=entry.agent_id,
+                confidence=p["confidence"],
+            )
+
+        elif entry.op == WALOp.REMOVE_NODE:
+            node_id = p["node_id"]
+            if node_id in self._add_nodes and node_id not in self._rem_nodes:
+                self.remove_node(node_id)
+
+        elif entry.op == WALOp.ADD_EDGE:
+            src, dst, label = p["source_id"], p["target_id"], p["label"]
+            if (
+                src in self.observed_nodes()
+                and dst in self.observed_nodes()
+            ):
+                try:
+                    self.add_causal_edge(src, dst, label)
+                except (CycleDetectedError, ValueError, NodeNotFoundError):
+                    pass  # Edge may conflict after replay ordering
+
+        elif entry.op == WALOp.REMOVE_EDGE:
+            edge = (p["source_id"], p["target_id"], p["label"])
+            if edge in self._add_edges and edge not in self._rem_edges:
+                self.remove_causal_edge(*edge)
+
+        # SNAPSHOT entries are handled by query_at, not replay
+
+    # =================================================================
+    # Point-in-time queries (TMP-003)
+    # =================================================================
+
+    def query_at(
+        self,
+        timestamp_utc: str,
+    ) -> "MemoryMeshCore":
+        """Reconstruct the graph state at a specific point in time (TMP-003).
+
+        Replays the WAL up to ``timestamp_utc``, building a fresh
+        MemoryMeshCore representing the historical belief state.
+
+        Parameters
+        ----------
+        timestamp_utc : str
+            ISO 8601 UTC timestamp.  The returned graph reflects
+            exactly the state at this moment.
+
+        Returns
+        -------
+        MemoryMeshCore
+            A new in-memory instance (no WAL) representing historical state.
+
+        Raises
+        ------
+        ValueError
+            If no WAL is configured (in-memory-only mode).
+        """
+        if self._wal is None:
+            raise ValueError(
+                "query_at() requires WAL persistence. "
+                "Initialize with wal_path to enable time-travel queries."
+            )
+
+        # Build a fresh mesh by replaying WAL up to the target time
+        historical = MemoryMeshCore(
+            namespace=self.namespace,
+            wal_path=None,  # No WAL for the historical view
+            decay_config=self._decay_config,
+            replay_wal=False,
+        )
+
+        for entry in self._wal.replay(up_to=timestamp_utc):
+            if entry.namespace != self.namespace:
+                continue
+            historical._apply_wal_entry(entry)
+
+        return historical
+
+    # =================================================================
+    # WAL snapshot + compaction (TMP-009)
+    # =================================================================
+
+    def create_snapshot(self) -> None:
+        """Write a snapshot to the WAL (TMP-009).
+
+        After a snapshot, older WAL entries can be compacted.
+        """
+        if self._wal is None:
+            return
+        self._wal.write_snapshot(
+            namespace=self.namespace,
+            snapshot_data=self.snapshot(),
+        )
+
+    def compact_wal(self) -> int:
+        """Compact the WAL by removing entries before the latest snapshot.
+
+        Returns
+        -------
+        int
+            Number of entries removed.
+        """
+        if self._wal is None:
+            return 0
+        snap = self._wal.find_latest_snapshot()
+        if snap is None:
+            return 0
+        return self._wal.compact(snap)
+
+    @property
+    def wal(self) -> Optional[WriteAheadLog]:
+        """Access the WAL instance (for testing/inspection)."""
+        return self._wal
+
     def __repr__(self) -> str:
+        wal_info = f", wal={self._wal.path}" if self._wal else ""
         return (
             f"MemoryMeshCore(namespace='{self.namespace}', "
-            f"nodes={self.node_count}, edges={self.edge_count})"
+            f"nodes={self.node_count}, edges={self.edge_count}{wal_info})"
         )
