@@ -37,8 +37,9 @@ PRD Requirements covered:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
@@ -50,9 +51,16 @@ from .temporal import (
     DEFAULT_DECAY_CONFIG,
     compute_effective_confidence,
 )
+from .trust_engine import (
+    BayesianTrustEngine,
+    ConflictResolution,
+    compute_belief_posteriors,
+    cosine_similarity,
+)
 from .types import (
     ALLOWED_EDGE_LABELS,
     CycleDetectedError,
+    EdgeLabel,
     NamespaceMismatchError,
     NodeNotFoundError,
 )
@@ -116,6 +124,11 @@ class MemoryMeshCore:
         namespace: str = "default",
         wal_path: Optional[str | Path] = None,
         decay_config: Optional[DecayConfig] = None,
+        trust_engine: Optional[BayesianTrustEngine] = None,
+        conflict_classifier: Optional[
+            Callable[[MemoryNode, MemoryNode], bool]
+        ] = None,
+        conflict_similarity_threshold: float = 0.85,
         replay_wal: bool = True,
     ) -> None:
         self.namespace = namespace
@@ -143,6 +156,12 @@ class MemoryMeshCore:
         # --- Temporal layer (TMP-005/006/007) ---
         self._decay_config = decay_config or DEFAULT_DECAY_CONFIG
         self._access_tracker = AccessTracker()
+
+        # --- Trust/conflict layer (TL-001..TL-008) ---
+        self._trust_engine = trust_engine or BayesianTrustEngine()
+        self._conflict_classifier = conflict_classifier
+        self._conflict_similarity_threshold = conflict_similarity_threshold
+        self._conflicts: list[ConflictResolution] = []
 
         # --- Replay WAL to reconstruct state ---
         if replay_wal and self._wal is not None:
@@ -223,6 +242,8 @@ class MemoryMeshCore:
         MemoryNode
             The (possibly merged) node now stored in the mesh.
         """
+        self._trust_engine.register_agent(agent_id)
+
         # Advance Lamport clock
         tau = self._advance_lamport(agent_id)
 
@@ -277,7 +298,8 @@ class MemoryMeshCore:
                     # Edge rejected but node write succeeds
                     pass
 
-        return node
+        self._detect_conflicts_for_node(node.id)
+        return self._nodes[node.id]
 
     def remove_node(self, node_id: str) -> None:
         """Tombstone a node (2P-set remove).
@@ -335,9 +357,11 @@ class MemoryMeshCore:
         ValueError
             If the label is not in ALLOWED_EDGE_LABELS.
         """
+        label_value = label.value if isinstance(label, EdgeLabel) else str(label)
+
         # Validate label
-        if label not in ALLOWED_EDGE_LABELS:
-            raise ValueError(f"Invalid edge label: {label}")
+        if label_value not in ALLOWED_EDGE_LABELS:
+            raise ValueError(f"Invalid edge label: {label_value}")
 
         # Both nodes must be observed (not removed)
         obs = self.observed_nodes()
@@ -348,12 +372,12 @@ class MemoryMeshCore:
 
         # Same-node self-loop is always a cycle
         if source_id == target_id:
-            raise CycleDetectedError(source_id, target_id, label)
+            raise CycleDetectedError(source_id, target_id, label_value)
 
         # DFS cycle check: can target already reach source?
         if self._graph.has_node(target_id) and self._graph.has_node(source_id):
             if nx.has_path(self._graph, target_id, source_id):
-                raise CycleDetectedError(source_id, target_id, label)
+                raise CycleDetectedError(source_id, target_id, label_value)
 
         # --- WAL: record before commit ---
         if self._wal is not None:
@@ -364,14 +388,14 @@ class MemoryMeshCore:
                 payload={
                     "source_id": source_id,
                     "target_id": target_id,
-                    "label": label,
+                    "label": label_value,
                 },
             )
 
         # Commit edge
-        edge_tuple = (source_id, target_id, label)
+        edge_tuple = (source_id, target_id, label_value)
         self._add_edges.add(edge_tuple)
-        self._graph.add_edge(source_id, target_id, label=label)
+        self._graph.add_edge(source_id, target_id, label=label_value)
 
         # Update the source node's causal_edges frozenset
         src_node = self._nodes[source_id]
@@ -393,7 +417,8 @@ class MemoryMeshCore:
         label: str,
     ) -> None:
         """Tombstone a causal edge (2P-set remove)."""
-        edge_tuple = (source_id, target_id, label)
+        label_value = label.value if isinstance(label, EdgeLabel) else str(label)
+        edge_tuple = (source_id, target_id, label_value)
         if edge_tuple not in self._add_edges:
             raise ValueError(f"Edge not found: {edge_tuple}")
 
@@ -406,7 +431,7 @@ class MemoryMeshCore:
                 payload={
                     "source_id": source_id,
                     "target_id": target_id,
-                    "label": label,
+                    "label": label_value,
                 },
             )
 
@@ -558,6 +583,339 @@ class MemoryMeshCore:
         """Access the read-frequency tracker (for testing/inspection)."""
         return self._access_tracker
 
+    @property
+    def trust_engine(self) -> BayesianTrustEngine:
+        """Access the trust engine used for conflict resolution."""
+        return self._trust_engine
+
+    def trust_update(
+        self,
+        agent_id: str,
+        memory_id: str,
+        outcome: bool,
+    ) -> float:
+        """Update an agent's trust score through the mesh API (TL-007)."""
+        return self._trust_engine.trust_update(agent_id, memory_id, outcome)
+
+    def trust_audit(self, agent_id: str):
+        """Return trust update history through the mesh API (TL-008)."""
+        return self._trust_engine.trust_audit(agent_id)
+
+    def conflicts(self) -> list[ConflictResolution]:
+        """Return semantic conflict resolution records."""
+        return list(self._conflicts)
+
+    def conflict_annotations(self, node_id: str) -> list[Dict[str, Any]]:
+        """Return conflict annotations stored on a memory node."""
+        node = self._nodes.get(node_id)
+        if node is None or node_id in self._rem_nodes:
+            raise NodeNotFoundError(node_id)
+        return list(node.trust_provenance.get("conflicts", []))
+
+    def get_canonical_belief(
+        self,
+        node_id: str,
+    ) -> Dict[str, Any]:
+        """Return the canonical belief state for a node (TL-005/TL-006).
+
+        If the node is involved in conflicts, returns the canonical
+        winner, posterior probability, and HIGH_UNCERTAINTY flag.
+        If the node has no conflicts, returns it as canonical with
+        confidence 1.0 and no uncertainty.
+
+        Parameters
+        ----------
+        node_id : str
+            Node to query.
+
+        Returns
+        -------
+        dict
+            {
+                "node_id": str,
+                "is_canonical": bool,
+                "canonical_node_id": str,
+                "posterior": float,
+                "high_uncertainty": bool,
+                "shadow_beliefs": [
+                    {
+                        "rival_node_id": str,
+                        "rival_posterior": float,
+                        "similarity": float,
+                    }, ...
+                ],
+            }
+
+        Raises
+        ------
+        NodeNotFoundError
+            If node_id is not observed.
+        """
+        if node_id not in self.observed_nodes():
+            raise NodeNotFoundError(node_id)
+
+        annotations = self.conflict_annotations(node_id)
+
+        if not annotations:
+            return {
+                "node_id": node_id,
+                "is_canonical": True,
+                "canonical_node_id": node_id,
+                "posterior": 1.0,
+                "high_uncertainty": False,
+                "shadow_beliefs": [],
+            }
+
+        # Build shadow beliefs from all conflict annotations
+        shadow_beliefs = []
+        is_canonical = True
+        posteriors = []
+        high_uncertainty = False
+
+        for annot in annotations:
+            rival_id = annot["other_node_id"]
+            my_posterior = annot["posterior"]
+            rival_posterior = 1.0 - my_posterior
+            canonical = annot["canonical_node_id"]
+
+            posteriors.append(my_posterior)
+            if canonical != node_id:
+                is_canonical = False
+            if annot.get("high_uncertainty", False):
+                high_uncertainty = True
+
+            shadow_beliefs.append({
+                "rival_node_id": rival_id,
+                "rival_posterior": rival_posterior,
+                "similarity": annot.get("similarity", 0.0),
+            })
+
+        # Use the worst-case posterior (most contested)
+        min_posterior = min(posteriors) if posteriors else 1.0
+
+        return {
+            "node_id": node_id,
+            "is_canonical": is_canonical,
+            "canonical_node_id": (
+                node_id if is_canonical
+                else annotations[0]["canonical_node_id"]
+            ),
+            "posterior": min_posterior,
+            "high_uncertainty": high_uncertainty,
+            "shadow_beliefs": shadow_beliefs,
+        }
+
+    def get_graph_with_conflicts(self) -> Dict[str, Any]:
+        """Return the full graph with conflict overlays for the API.
+
+        Includes nodes, edges, and conflict resolution records in a
+        format ready for visualization.
+
+        Returns
+        -------
+        dict
+            {
+                "nodes": [...],
+                "edges": [...],
+                "conflicts": [...],
+            }
+        """
+        nodes = []
+        for node in self.get_all_nodes():
+            belief = self.get_canonical_belief(node.id)
+            nodes.append({
+                "id": node.id,
+                "label": node.content[:20],
+                "confidence": node.confidence,
+                "lamport_vector": node.lamport_vector,
+                "full_content": node.content,
+                "is_canonical": belief["is_canonical"],
+                "posterior": belief["posterior"],
+                "high_uncertainty": belief["high_uncertainty"],
+                "conflict_count": len(belief["shadow_beliefs"]),
+            })
+
+        edges = [
+            {"source": src, "target": dst, "label": label}
+            for src, dst, label in self.observed_edges()
+        ]
+
+        conflicts = [c.as_dict() for c in self._conflicts]
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "conflicts": conflicts,
+        }
+
+    def detect_semantic_conflicts(
+        self,
+        node_id: Optional[str] = None,
+    ) -> list[ConflictResolution]:
+        """Run semantic conflict detection for one node or the full mesh.
+
+        A conflict requires both conditions from TL-003:
+        cosine similarity above the namespace threshold and a positive
+        classifier result. The classifier is injectable so production can
+        use a local LLM while tests remain deterministic.
+        """
+        before = len(self._conflicts)
+        if node_id is not None:
+            self._detect_conflicts_for_node(node_id)
+        else:
+            for observed_id in sorted(self.observed_nodes()):
+                self._detect_conflicts_for_node(observed_id)
+        return self._conflicts[before:]
+
+    def _detect_conflicts_for_node(self, node_id: str) -> None:
+        if self._conflict_classifier is None:
+            return
+        if node_id not in self.observed_nodes() or node_id not in self._nodes:
+            return
+
+        node = self._nodes[node_id]
+        for other_id in sorted(self.observed_nodes()):
+            if other_id == node_id or other_id not in self._nodes:
+                continue
+            if self._has_conflict(node_id, other_id):
+                continue
+
+            other = self._nodes[other_id]
+            similarity = cosine_similarity(node.embedding, other.embedding)
+            if similarity <= self._conflict_similarity_threshold:
+                continue
+            if not self._conflict_classifier(node, other):
+                continue
+
+            self._record_conflict(node.id, other.id, similarity)
+
+    def _has_conflict(self, left_id: str, right_id: str) -> bool:
+        pair = frozenset((left_id, right_id))
+        return any(frozenset((c.left_id, c.right_id)) == pair for c in self._conflicts)
+
+    def _node_bts(self, node: MemoryNode) -> float:
+        agent_id = node.trust_provenance.get("agent_id", "__unknown__")
+        if isinstance(agent_id, list):
+            scores = [self._agent_bts(str(agent)) for agent in agent_id]
+            return sum(scores) / len(scores) if scores else 0.5
+        return self._agent_bts(str(agent_id))
+
+    def _agent_bts(self, agent_id: str) -> float:
+        try:
+            return self._trust_engine.get_bts(agent_id)
+        except KeyError:
+            self._trust_engine.register_agent(agent_id)
+            return self._trust_engine.get_bts(agent_id)
+
+    def _record_conflict(
+        self,
+        left_id: str,
+        right_id: str,
+        similarity: float,
+        timestamp_utc: Optional[str] = None,
+        resolution: Optional[ConflictResolution] = None,
+        log_to_wal: bool = True,
+    ) -> ConflictResolution:
+        if self._has_conflict(left_id, right_id):
+            for existing in self._conflicts:
+                if frozenset((existing.left_id, existing.right_id)) == frozenset((left_id, right_id)):
+                    return existing
+
+        left = self._nodes[left_id]
+        right = self._nodes[right_id]
+        ts = timestamp_utc or datetime.now(timezone.utc).isoformat()
+
+        if resolution is None:
+            left_post, right_post = compute_belief_posteriors(
+                left.confidence,
+                self._node_bts(left),
+                right.confidence,
+                self._node_bts(right),
+            )
+            high_uncertainty = (
+                abs(left_post - 0.5) <= 0.10
+                and abs(right_post - 0.5) <= 0.10
+            )
+            canonical = left_id if left_post >= right_post else right_id
+            resolution = ConflictResolution(
+                left_id=left_id,
+                right_id=right_id,
+                similarity=similarity,
+                left_posterior=left_post,
+                right_posterior=right_post,
+                high_uncertainty=high_uncertainty,
+                canonical_node_id=canonical,
+                timestamp_utc=ts,
+            )
+
+        self._conflicts.append(resolution)
+        self._add_conflict_edge(left_id, right_id)
+        self._add_conflict_edge(right_id, left_id)
+        self._annotate_conflict(left_id, right_id, resolution, is_left=True)
+        self._annotate_conflict(right_id, left_id, resolution, is_left=False)
+
+        if self._wal is not None and log_to_wal:
+            self._wal.append(
+                op=WALOp.CONFLICT_DETECTED,
+                agent_id="__system__",
+                namespace=self.namespace,
+                payload={"resolution": resolution.as_dict()},
+                timestamp_utc=resolution.timestamp_utc,
+            )
+
+        return resolution
+
+    def _add_conflict_edge(self, source_id: str, target_id: str) -> None:
+        edge_tuple = (source_id, target_id, EdgeLabel.CONTRADICTS.value)
+        self._add_edges.add(edge_tuple)
+        node = self._nodes[source_id]
+        updated = MemoryNode(
+            id=node.id,
+            embedding=node.embedding,
+            lamport_vector=node.lamport_vector,
+            causal_edges=node.causal_edges | {edge_tuple},
+            confidence=node.confidence,
+            trust_provenance=node.trust_provenance,
+            content=node.content,
+        )
+        self._nodes[source_id] = updated
+
+    def _annotate_conflict(
+        self,
+        node_id: str,
+        other_id: str,
+        resolution: ConflictResolution,
+        is_left: bool,
+    ) -> None:
+        node = self._nodes[node_id]
+        provenance = dict(node.trust_provenance)
+        annotations = list(provenance.get("conflicts", []))
+        posterior = (
+            resolution.left_posterior
+            if is_left else resolution.right_posterior
+        )
+        annotations.append({
+            "other_node_id": other_id,
+            "posterior": posterior,
+            "canonical_node_id": resolution.canonical_node_id,
+            "high_uncertainty": resolution.high_uncertainty,
+            "timestamp_utc": resolution.timestamp_utc,
+            "similarity": resolution.similarity,
+        })
+        provenance["conflicts"] = sorted(
+            annotations,
+            key=lambda item: (item["other_node_id"], item["timestamp_utc"]),
+        )
+        self._nodes[node_id] = MemoryNode(
+            id=node.id,
+            embedding=node.embedding,
+            lamport_vector=node.lamport_vector,
+            causal_edges=node.causal_edges,
+            confidence=node.confidence,
+            trust_provenance=provenance,
+            content=node.content,
+        )
+
     # =================================================================
     # CRDT merge (SYN-002, SYN-003, SYN-005)
     # =================================================================
@@ -590,7 +948,18 @@ class MemoryMeshCore:
         if self.namespace != other.namespace:
             raise NamespaceMismatchError(self.namespace, other.namespace)
 
-        merged = MemoryMeshCore(namespace=self.namespace)
+        merged = MemoryMeshCore(
+            namespace=self.namespace,
+            decay_config=self._decay_config,
+            trust_engine=self._trust_engine,
+            conflict_classifier=(
+                self._conflict_classifier or other._conflict_classifier
+            ),
+            conflict_similarity_threshold=min(
+                self._conflict_similarity_threshold,
+                other._conflict_similarity_threshold,
+            ),
+        )
 
         # --- Merge Lamport vectors (TMP-002) ---
         merged._lamport = merge_lamport_vectors(self._lamport, other._lamport)
@@ -613,6 +982,20 @@ class MemoryMeshCore:
             else:
                 merged._nodes[nid] = left.merge_with(right)
 
+        for conflict in self._conflicts + other._conflicts:
+            if not merged._has_conflict(conflict.left_id, conflict.right_id):
+                if (
+                    conflict.left_id in merged._nodes
+                    and conflict.right_id in merged._nodes
+                ):
+                    merged._record_conflict(
+                        conflict.left_id,
+                        conflict.right_id,
+                        conflict.similarity,
+                        resolution=conflict,
+                        log_to_wal=False,
+                    )
+
         # --- Rebuild NetworkX graph from observed state ---
         for nid in merged.observed_nodes():
             merged._graph.add_node(nid)
@@ -622,11 +1005,20 @@ class MemoryMeshCore:
                 src in merged.observed_nodes()
                 and dst in merged.observed_nodes()
             ):
+                reverse_conflict = (
+                    label == EdgeLabel.CONTRADICTS.value
+                    and (dst, src, label) in merged.observed_edges()
+                )
+                if reverse_conflict:
+                    continue
                 # Skip edges that would create cycles
                 if merged._graph.has_node(dst) and merged._graph.has_node(src):
                     if nx.has_path(merged._graph, dst, src):
                         continue
                 merged._graph.add_edge(src, dst, label=label)
+
+        if merged._conflict_classifier is not None:
+            merged.detect_semantic_conflicts()
 
         return merged
 
@@ -649,6 +1041,7 @@ class MemoryMeshCore:
                 "lamport_vector": dict(sorted(node.lamport_vector.items())),
                 "causal_edges": sorted(node.causal_edges),
                 "confidence": node.confidence,
+                "conflicts": node.trust_provenance.get("conflicts", []),
                 "content": node.content,
             }
 
@@ -659,6 +1052,13 @@ class MemoryMeshCore:
             "add_edges": sorted(self._add_edges),
             "rem_edges": sorted(self._rem_edges),
             "lamport": dict(sorted(self._lamport.items())),
+            "conflicts": [
+                conflict.as_dict()
+                for conflict in sorted(
+                    self._conflicts,
+                    key=lambda c: (c.left_id, c.right_id, c.timestamp_utc),
+                )
+            ],
             "nodes": node_snap,
         }
 
@@ -727,6 +1127,20 @@ class MemoryMeshCore:
             edge = (p["source_id"], p["target_id"], p["label"])
             if edge in self._add_edges and edge not in self._rem_edges:
                 self.remove_causal_edge(*edge)
+
+        elif entry.op == WALOp.CONFLICT_DETECTED:
+            resolution = ConflictResolution.from_dict(p["resolution"])
+            if (
+                resolution.left_id in self._nodes
+                and resolution.right_id in self._nodes
+            ):
+                self._record_conflict(
+                    resolution.left_id,
+                    resolution.right_id,
+                    resolution.similarity,
+                    resolution=resolution,
+                    log_to_wal=False,
+                )
 
         # SNAPSHOT entries are handled by query_at, not replay
 

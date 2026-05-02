@@ -10,9 +10,9 @@ MemoryMesh is **"The Persistent Cognitive Substrate for the Agentic Internet"** 
 
 | Property | Value |
 |----------|-------|
-| **Current Phase** | Temporal Persistence — Week 2 (v0.2.0) |
-| **Stack** | Pure Python 3.11+, NetworkX, NumPy |
-| **Not yet active** | FastAPI (Week 6), GPU acceleration |
+| **Current Phase** | Semantic Conflict Resolution — Week 3 (v0.3.0) |
+| **Stack** | Pure Python 3.11+, NetworkX, NumPy, FastAPI |
+| **Not yet active** | GPU acceleration, LangChain/LlamaIndex |
 
 ---
 
@@ -50,10 +50,11 @@ python -m pytest tests/ -v --benchmark-only
 ```
 types.py              → (no internal deps, vocabulary only)
 memory_node.py        → types.py
-trust_engine.py       → (standalone, no internal deps)
+trust_engine.py       → numpy (cosine similarity, conflict resolution)
 wal.py                → (standalone, JSON-lines persistence)
 temporal.py           → (standalone, decay/boost math)
-mesh_core.py          → memory_node.py, types.py, wal.py, temporal.py
+mesh_core.py          → memory_node.py, types.py, wal.py, temporal.py, trust_engine.py
+api.py                → mesh_core.py (FastAPI bridge, root-level)
 __init__.py           → aggregates all above (public API)
 ```
 
@@ -63,10 +64,11 @@ __init__.py           → aggregates all above (public API)
 |--------|-------|---------|
 | `types.py` | `EdgeLabel`, exceptions | Shared vocabulary — 5 edge labels + error types |
 | `memory_node.py` | `MemoryNode` | Immutable 7-tuple cognitive unit `(id, e, τ, C, R, T, κ)` |
-| `trust_engine.py` | `BayesianTrustEngine` | Per-agent Beta-Binomial trust tracking `BTS = α/(α+β)` |
+| `trust_engine.py` | `BayesianTrustEngine`, `ConflictResolution` | Beta-Binomial trust, cosine similarity, belief posteriors |
 | `wal.py` | `WriteAheadLog`, `WALEntry` | Append-only WAL: fsync'd JSON-lines, crash recovery, replay |
 | `temporal.py` | `DecayConfig`, `AccessTracker` | Ebbinghaus decay + spaced repetition boost (lazy on read) |
-| `mesh_core.py` | `MemoryMeshCore`, `CRDTState` | 2P2P-Graph CRDT engine + WAL integration + time-travel |
+| `mesh_core.py` | `MemoryMeshCore`, `CRDTState` | 2P2P-Graph CRDT + WAL + time-travel + conflict detection |
+| `api.py` | FastAPI app | Read-only graph API at `/api/graph` and `/api/graph/conflicts` |
 
 ---
 
@@ -162,9 +164,11 @@ NumPy arrays for embeddings must use `dtype=np.float32` for future CUDA compatib
 | **SYN-004** | Content-addressed dedup (SHA-256) | ✅ | `memory_node.py` |
 | **SYN-006** | DFS cycle detection | ✅ | `mesh_core.py` |
 | **SYN-007** | Namespace isolation | ✅ | `mesh_core.py` |
-| **TL-003/004** | Semantic conflict detection | ❌ | (Week 3) |
-| **TL-005/006** | Conflict resolution + belief probs | ❌ | (Week 3) |
-| **LangChain** | Drop-in integration | ❌ | (Week 4+) |
+| **TL-003** | Semantic conflict detection (cosine sim) | ✅ | `trust_engine.py`, `mesh_core.py` |
+| **TL-004** | Injectable conflict classifier | ✅ | `mesh_core.py` |
+| **TL-005** | Posterior belief probabilities | ✅ | `trust_engine.py`, `mesh_core.py` |
+| **TL-006** | HIGH_UNCERTAINTY signal (±0.10 of 0.50) | ✅ | `trust_engine.py`, `mesh_core.py` |
+| **LangChain** | Drop-in integration | ❌ | (Week 5+) |
 
 ---
 
@@ -172,7 +176,6 @@ NumPy arrays for embeddings must use `dtype=np.float32` for future CUDA compatib
 
 | Feature | PRD Ref | Planned |
 |---------|---------|---------|
-| Semantic conflict detection | TL-003, TL-004, TL-005, TL-006 | Week 3 |
 | GPU acceleration (FAISS, cuGraph) | Performance targets | Week 4+ |
 | LangChain integration | Interoperability | Week 5+ |
 | LlamaIndex integration | Interoperability | Week 5+ |

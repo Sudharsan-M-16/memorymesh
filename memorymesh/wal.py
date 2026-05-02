@@ -39,6 +39,7 @@ class WALOp(str, Enum):
     REMOVE_NODE = "remove_node"
     ADD_EDGE = "add_edge"
     REMOVE_EDGE = "remove_edge"
+    CONFLICT_DETECTED = "conflict_detected"
     SNAPSHOT = "snapshot"
 
 

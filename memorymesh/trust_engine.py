@@ -18,9 +18,11 @@ PRD Requirements covered:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +43,62 @@ class AuditEntry(NamedTuple):
     beta_before: float      # β before update
     alpha_after: float      # α after update
     beta_after: float       # β after update
+
+
+@dataclass(frozen=True)
+class ConflictResolution:
+    """Immutable semantic conflict resolution record (TL-003..TL-006)."""
+
+    left_id: str
+    right_id: str
+    similarity: float
+    left_posterior: float
+    right_posterior: float
+    high_uncertainty: bool
+    canonical_node_id: str
+    timestamp_utc: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable representation."""
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "ConflictResolution":
+        """Rebuild a ConflictResolution from WAL/snapshot data."""
+        return ConflictResolution(
+            left_id=data["left_id"],
+            right_id=data["right_id"],
+            similarity=float(data["similarity"]),
+            left_posterior=float(data["left_posterior"]),
+            right_posterior=float(data["right_posterior"]),
+            high_uncertainty=bool(data["high_uncertainty"]),
+            canonical_node_id=data["canonical_node_id"],
+            timestamp_utc=data["timestamp_utc"],
+        )
+
+
+def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    """Compute cosine similarity for two embedding vectors."""
+    left_norm = float(np.linalg.norm(left))
+    right_norm = float(np.linalg.norm(right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    return float(np.dot(left, right) / (left_norm * right_norm))
+
+
+def compute_belief_posteriors(
+    left_confidence: float,
+    left_bts: float,
+    right_confidence: float,
+    right_bts: float,
+) -> Tuple[float, float]:
+    """Compute normalized posterior belief probabilities for two nodes."""
+    left_score = max(0.0, left_confidence) * max(0.0, left_bts)
+    right_score = max(0.0, right_confidence) * max(0.0, right_bts)
+    total = left_score + right_score
+    if total == 0.0:
+        return (0.5, 0.5)
+    return (left_score / total, right_score / total)
 
 
 # ---------------------------------------------------------------------------

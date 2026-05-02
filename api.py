@@ -1,8 +1,11 @@
 """Read-only FastAPI bridge for MemoryMesh DAG visualization.
 
-Exposes a single GET endpoint that formats the in-memory CRDT graph
-into a JSON structure compatible with standard graph visualizers
-(e.g. D3.js, Cytoscape, vis.js).
+Exposes endpoints that format the in-memory CRDT graph into JSON
+structures compatible with standard graph visualizers.
+
+Endpoints:
+    GET /api/graph           — nodes + edges (basic, backward-compatible)
+    GET /api/graph/conflicts — nodes + edges + conflict overlays
 
 Run:
     uvicorn api:app --reload --port 8000
@@ -26,7 +29,7 @@ mesh = MemoryMeshCore(namespace="sandbox", wal_path="sandbox.wal")
 app = FastAPI(
     title="MemoryMesh DAG API",
     description="Read-only bridge for visualizing the MemoryMesh causal graph.",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -66,3 +69,15 @@ def get_graph() -> dict:
     ]
 
     return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/api/graph/conflicts")
+def get_graph_with_conflicts() -> dict:
+    """Return the full DAG with conflict overlays.
+
+    Each node includes ``is_canonical``, ``posterior``,
+    ``high_uncertainty``, and ``conflict_count`` fields.
+    The response also includes a top-level ``conflicts`` array
+    with full conflict resolution records.
+    """
+    return mesh.get_graph_with_conflicts()

@@ -1,11 +1,16 @@
 """MemoryMesh — The Persistent Cognitive Substrate for the Agentic Internet.
 
-Public API surface for v0.2.0 (Brain Stem + Temporal Layer).
+Public API surface for v0.3.0 (Brain Stem + Temporal Layer + Conflict Resolution).
 
 Core exports:
     MemoryNode          — 7-tuple cognitive unit (content-addressed)
     MemoryMeshCore      — 2P2P-Graph CRDT engine with WAL persistence
     BayesianTrustEngine — Per-agent Beta-Binomial trust model
+
+Conflict Resolution:
+    ConflictResolution  — Immutable conflict record with posteriors
+    cosine_similarity   — Embedding comparison for conflict candidate screening
+    compute_belief_posteriors — Bayesian posterior belief calculation
 
 Temporal:
     WriteAheadLog       — Append-only WAL for crash recovery + time-travel
@@ -29,7 +34,13 @@ from .temporal import (
     compute_decayed_confidence,
     compute_effective_confidence,
 )
-from .trust_engine import AuditEntry, BayesianTrustEngine
+from .trust_engine import (
+    AuditEntry,
+    BayesianTrustEngine,
+    ConflictResolution,
+    compute_belief_posteriors,
+    cosine_similarity,
+)
 from .types import (
     ALLOWED_EDGE_LABELS,
     CycleDetectedError,
@@ -39,13 +50,14 @@ from .types import (
 )
 from .wal import WALEntry, WALOp, WriteAheadLog
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     # Core
     "MemoryNode",
     "MemoryMeshCore",
     "BayesianTrustEngine",
+    "ConflictResolution",
     # WAL
     "WriteAheadLog",
     "WALOp",
@@ -67,6 +79,8 @@ __all__ = [
     # Helpers
     "ALLOWED_EDGE_LABELS",
     "content_address",
+    "compute_belief_posteriors",
+    "cosine_similarity",
     "zero_embedding",
     # Meta
     "__version__",
